@@ -141,6 +141,114 @@ metadata:
 | 22 | `export_publish` | 导出发布材料 |
 | 23 | `citation_verify` | 引文验证 |
 
+## 23 个 Stage 的作用、输入输出与限制
+
+AutoResearchClaw 的每个 stage 都有一个 I/O contract，定义在 `researchclaw/pipeline/contracts.py`。这些 contract 用来约束 stage 读什么、必须产出什么、什么时候算完成，以及失败后最多重试几次。
+
+表里的“输入/输出”是 artifact 文件或目录名，通常位于一次运行的 `artifacts/<run-id>/stage-<N>/` 附近，后续 stage 会读取前序 stage 的产物。
+
+| Stage | 作用 | 输入 | 输出 | 主要限制 |
+| --- | --- | --- | --- | --- |
+| 1 `TOPIC_INIT` | 把用户自然语言课题变成可执行的 SMART research goal，并记录硬件环境 | 用户 topic、config、硬件探测 | `goal.md`, `hardware_profile.json` | 不做文献和实验；只定义范围、目标、约束。`max_retries=0`，目标不清会直接失败 |
+| 2 `PROBLEM_DECOMPOSE` | 把目标拆成子问题、变量、风险和优先级 | `goal.md` | `problem_tree.md` | 至少要有 3 个优先级明确的 sub-questions；不能直接跳到实验 |
+| 3 `SEARCH_STRATEGY` | 设计检索策略、数据源和 query 组合 | `problem_tree.md` | `search_plan.yaml`, `sources.json`, `queries.json` | 至少 2 种 search strategy；数据源必须可验证，不能只写泛泛的“查论文” |
+| 4 `LITERATURE_COLLECT` | 按检索计划收集候选论文或资料 | `search_plan.yaml` | `candidates.jsonl` | 候选集不能为空；最多重试 2 次；受 API、网络、检索源覆盖范围限制 |
+| 5 `LITERATURE_SCREEN` | 对候选文献做 relevance 和 quality 双重筛选 | `candidates.jsonl` | `shortlist.jsonl` | Gate stage，默认需要 human approval；拒绝后回滚到 stage 4；不能保留不相关或低质量来源 |
+| 6 `KNOWLEDGE_EXTRACT` | 从 shortlisted papers 中抽取结构化知识卡片 | `shortlist.jsonl` | `cards/` | 每篇入选文献应有 card；需要区分方法、数据、结果、限制和可复用证据 |
+| 7 `SYNTHESIS` | 聚类文献发现，归纳研究 gap | `cards/` | `synthesis.md` | 至少识别 2 个 research gaps；不能只总结文献，必须说明未解决问题 |
+| 8 `HYPOTHESIS_GEN` | 生成可证伪 hypothesis 和可观测预测 | `synthesis.md` | `hypotheses.md` | 至少 2 个 falsifiable hypotheses；需要能映射到实验条件 |
+| 9 `EXPERIMENT_DESIGN` | 设计实验计划、baseline、ablation、metrics | `hypotheses.md` | `exp_plan.yaml` | Gate stage，默认需要 approval；拒绝后回滚到 stage 8；必须包含 baselines、ablations、metrics |
+| 10 `CODE_GENERATION` | 根据实验计划生成可执行实验项目 | `exp_plan.yaml` | `experiment/`, `experiment_spec.md` | 最多重试 2 次；代码应可运行、可复现；`hep_ph` profile 下额外产生 `collider_plan.md` 且可成为 gate |
+| 11 `RESOURCE_PLANNING` | 规划 GPU/CPU/时间/并发等资源 | `exp_plan.yaml` | `schedule.json` | 需要估计资源和运行顺序；不能安排超出硬件 profile 的任务 |
+| 12 `EXPERIMENT_RUN` | 按 schedule 执行实验，收集原始结果 | `schedule.json`, `experiment/` | `runs/` | 最多重试 2 次；不能伪造结果；sandbox/SSH/Docker 等执行模式受环境依赖限制 |
+| 13 `ITERATIVE_REFINE` | 对失败或弱结果做 edit-run-eval 迭代 | `runs/` | `refinement_log.json`, `experiment_final/` | 最多重试 2 次；必须记录每次修改和原因；不能改变研究问题后仍声称同一实验 |
+| 14 `RESULT_ANALYSIS` | 统计分析实验结果，生成结论和表格 | `runs/` | `analysis.md` | 需要统计检验和结论；不能把训练集指标当测试集指标；不能忽略失败 run |
+| 15 `RESEARCH_DECISION` | 根据证据决定 PROCEED、REFINE 或 PIVOT | `analysis.md` | `decision.md` | PIVOT 回滚到 stage 8，REFINE 回滚到 stage 13；最多 2 次 pivot，防止无限循环 |
+| 16 `PAPER_OUTLINE` | 生成论文结构和 section-level plan | `analysis.md`, `decision.md` | `outline.md` | 必须覆盖摘要、引言、方法、实验、结果、限制；不能写成空泛目录 |
+| 17 `PAPER_DRAFT` | 写完整论文初稿 | `outline.md` | `paper_draft.md` | 必须与已有证据一致；引用应来自 collected literature；不能编造结果或引用 |
+| 18 `PEER_REVIEW` | 多视角模拟 peer review，指出问题 | `paper_draft.md` | `reviews.md` | 至少 2 个 review perspectives；反馈必须 actionable，不只是笼统评价 |
+| 19 `PAPER_REVISION` | 根据 review 修改论文 | `paper_draft.md`, `reviews.md` | `paper_revised.md` | 需要回应 review comments；不能无解释删除负面结果或限制 |
+| 20 `QUALITY_GATE` | 最终质量门，检查质量分数和批准状态 | `paper_revised.md` | `quality_report.json` | Gate stage，拒绝后回滚到 stage 16；这是 critical stage，不能跳过低质量论文 |
+| 21 `KNOWLEDGE_ARCHIVE` | 归档回顾、实验 bundle 和复现索引 | 通常读取整次 run 的上下文 | `archive.md`, `bundle_index.json` | 非关键 stage，失败不应影响 paper output；但会影响长期复用和复现 |
+| 22 `EXPORT_PUBLISH` | 导出最终论文、代码和提交包 | `paper_revised.md` | `paper_final.md`, `code/` | 必须使用目标格式；不能在 citation verification 之前宣称引用全部可靠 |
+| 23 `CITATION_VERIFY` | 用真实 API/规则验证引用，标记幻觉引用 | `paper_final.md`，可选 `references.bib` | `verification_report.json`, `references_verified.bib` | 伪造引用必须 block export；`references.bib` 可选，但 final paper 中引用必须可核验 |
+
+### Gate、Rollback 与 Retry 限制
+
+默认 gate stage：
+
+- Stage 5 `LITERATURE_SCREEN`：拒绝后回滚到 stage 4，重新收集或筛选文献。
+- Stage 9 `EXPERIMENT_DESIGN`：拒绝后回滚到 stage 8，重新生成或修正 hypotheses。
+- Stage 20 `QUALITY_GATE`：拒绝后回滚到 stage 16，重写 outline/draft/revision。
+
+特殊情况：
+
+- `hep_ph` profile 下，stage 10 `CODE_GENERATION` 会成为强制 gate，因为昂贵的 ColliderAgent 物理流水线运行前需要检查 `collider_plan.md`。
+- Stage 15 的 `PIVOT` 回滚到 stage 8，`REFINE` 回滚到 stage 13。
+- `MAX_DECISION_PIVOTS=2`，避免 pipeline 无限换题。
+- Stage 21 `KNOWLEDGE_ARCHIVE` 是 noncritical；其他质量、引用和实验相关 stage 不应随意跳过。
+
+## User Case：一个研究课题如何流经 23 个 Stage
+
+假设用户输入：
+
+```text
+研究课题：在 CIFAR-100 小样本设置下，token pruning 是否能降低 Vision Transformer 推理成本，同时保持分类准确率？
+约束：只能使用单张 24GB GPU；总实验时间控制在 6 小时内；必须比较 ResNet-18、ViT-base、ViT+token pruning；至少 3 个随机种子；输出 NeurIPS 风格论文草稿。
+```
+
+最终期望输出：
+
+```text
+artifacts/rc-YYYYMMDD-HHMMSS-<hash>/
+├── paper_final.md
+├── references_verified.bib
+├── verification_report.json
+├── code/
+├── stage-14/analysis.md
+├── stage-17/paper_draft.md
+├── stage-19/paper_revised.md
+└── stage-22/...
+```
+
+这个课题的 stage-by-stage 输入输出可以这样理解：
+
+| Stage | 本案例中的输入 | 本案例中的输出 | 本案例中的限制/检查 |
+| --- | --- | --- | --- |
+| 1 | 用户课题、GPU/时间/seed 约束 | `goal.md` 写明 CIFAR-100、token pruning、准确率/延迟/FLOPs；`hardware_profile.json` 记录 24GB GPU | 如果课题没有数据集、指标或资源约束，stage 1 应要求补全或失败 |
+| 2 | `goal.md` | `problem_tree.md` 拆成准确率、推理成本、小样本鲁棒性、baseline 公平性 | 子问题不能少于 3 个；需要标出优先级 |
+| 3 | `problem_tree.md` | `search_plan.yaml` 包含 ViT pruning、dynamic token sparsification、CIFAR small-data、efficient inference 查询 | 检索源至少含 arXiv/Semantic Scholar/OpenAlex 等可核验来源 |
+| 4 | `search_plan.yaml` | `candidates.jsonl` 收集候选论文，如 DeiT、DynamicViT、ToMe、ViT pruning、小样本学习文献 | 候选为空要重试；不能把博客当主要证据 |
+| 5 | `candidates.jsonl` | `shortlist.jsonl` 保留与 token pruning、ViT efficiency、小样本分类直接相关文献 | Gate；人类可拒绝“只收集到 CNN pruning，缺少 ViT pruning”的 shortlist |
+| 6 | `shortlist.jsonl` | `cards/` 每篇论文抽取方法、数据集、指标、结论、限制 | card 需区分 paper claim 和可复现实验事实 |
+| 7 | `cards/` | `synthesis.md` 总结 gap：小样本 ViT 下 pruning 是否损害泛化、是否只提升 FLOPs 而非 wall-clock | 至少 2 个 gap，不能只是摘要拼接 |
+| 8 | `synthesis.md` | `hypotheses.md`：H1 token pruning 降低 FLOPs 且 accuracy drop <1%；H2 小样本下 pruning 需正则化才能稳定 | hypothesis 必须可被实验反驳 |
+| 9 | `hypotheses.md` | `exp_plan.yaml`：3 seeds、CIFAR-100 subset、ResNet-18/ViT/ViT-pruned、accuracy/FLOPs/latency、ablation pruning ratio | Gate；如果缺 baseline、seed 或 ablation，应拒绝 |
+| 10 | `exp_plan.yaml` | `experiment/` 生成训练、评估、FLOPs/latency 测量代码；`experiment_spec.md` 说明运行方式 | 代码必须记录 config、seed、metrics；不能只输出随机模拟结果 |
+| 11 | `exp_plan.yaml` | `schedule.json` 安排 seed、baseline、batch size、预计时长 | 6 小时和 24GB GPU 是硬限制；超出需缩小模型或减少非核心 ablation |
+| 12 | `schedule.json`, `experiment/` | `runs/` 保存每个 baseline/seed 的 metrics、logs、checkpoints | CUDA OOM 要 retry 或结构化失败；不能删除失败 run |
+| 13 | `runs/` | `refinement_log.json` 记录修复，如 batch size 降低、AMP 开启；`experiment_final/` 保存最终代码 | 修改必须只影响资源或 bug，不能偷偷改变 hypothesis |
+| 14 | `runs/` | `analysis.md` 比较 accuracy、FLOPs、latency、方差、显著性和失败情况 | 需要 mean +/- std；不能只报告最好 seed |
+| 15 | `analysis.md` | `decision.md` 决定 PROCEED/REFINE/PIVOT。例如 accuracy drop 过大则 REFINE pruning ratio | REFINE 回 stage 13；若 hypothesis 不成立，可 PIVOT 到新的 hypothesis |
+| 16 | `analysis.md`, `decision.md` | `outline.md` 规划 NeurIPS 风格结构：Intro、Related Work、Method、Experiments、Limitations | 大纲必须和实验结论一致 |
+| 17 | `outline.md` | `paper_draft.md` 初稿，包含方法、表格、图和局限性 | 不得声称未测数据集；不得伪造引用 |
+| 18 | `paper_draft.md` | `reviews.md` 多视角 review：ML 方法、公平比较、统计可靠性、写作质量 | 至少 2 个具体 review perspectives |
+| 19 | `paper_draft.md`, `reviews.md` | `paper_revised.md` 回应 reviewer，补充限制和实验设置 | 不得为了更好看而删掉负面发现 |
+| 20 | `paper_revised.md` | `quality_report.json` 检查质量、证据一致性、实验充分性 | Gate；如果结果不足支撑 claim，应回滚 stage 16 |
+| 21 | 整个 run 上下文 | `archive.md`, `bundle_index.json` 归档 config、代码、结果和经验 | 失败不应阻断论文，但会降低复现性 |
+| 22 | `paper_revised.md` | `paper_final.md`, `code/` 导出最终稿和代码包 | 导出不等于引用已验证；仍需 stage 23 |
+| 23 | `paper_final.md` 和可选 `references.bib` | `verification_report.json`, `references_verified.bib` | 如果 DynamicViT/ToMe 等引用不存在或不匹配，必须标记并修复 |
+
+这个 user case 展示了 skill 应该如何帮助 pipeline：
+
+- stage 3-6 会匹配 `literature-search` / `systematic-review`；
+- stage 7-9 会匹配 `hypothesis-formulation` / `experimental-design`；
+- stage 10-12 会匹配 `pytorch-training`、`data-loading`、`mixed-precision`，如果 topic 包含 RL 则会匹配 `rl-policy-optimization`；
+- stage 14 会匹配 `statistical-reporting`；
+- stage 16-19 会匹配 `scientific-writing`；
+- stage 22 会匹配 `scientific-visualization`；
+- 如果用户加入自定义 `cuda-oom-recovery`，stage 10/12/13 会在 CUDA OOM 相关 context 下自动注入。
+
 写 skill 时应尽量绑定具体 stage。例如：
 
 - literature 类 skill：stage 3-6；
